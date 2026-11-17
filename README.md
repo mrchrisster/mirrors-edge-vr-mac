@@ -1,4 +1,4 @@
-(mirrors-edge-vr-stereo.png)
+![alt text](mirrors-edge-vr-stereo.png)
 
 
 # Mirror's Edge VR on macOS → Meta Quest
