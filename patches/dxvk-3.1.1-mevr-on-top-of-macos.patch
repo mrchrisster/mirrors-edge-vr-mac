@@ -1,0 +1,118 @@
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index 96dfa5d1..997990a7 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -1,9 +1,11 @@
+ #include <cstring>
+ #include <unordered_set>
+ 
++#include <dlfcn.h>
+ #include "dxvk_adapter.h"
+ #include "dxvk_device.h"
+ #include "dxvk_instance.h"
++#include "../util/util_env.h"
+ 
+ namespace dxvk {
+ 
+@@ -233,6 +235,27 @@ namespace dxvk {
+     std::vector<VkExtensionProperties> extensions(extensionCount);
+     caps.queryDeviceExtensions(&extensionCount, extensions.data());
+ 
++    if (env::getEnvVar("ME_PC_UPSCALER") == "metalfx" || !env::getEnvVar("ME_PC_METALFX_DUMP").empty()) {
++      uint32_t supportedCount = 0u;
++      m_instance->vki()->vkEnumerateDeviceExtensionProperties(m_handle, nullptr, &supportedCount, nullptr);
++      std::vector<VkExtensionProperties> supported(supportedCount);
++      m_instance->vki()->vkEnumerateDeviceExtensionProperties(m_handle, nullptr, &supportedCount, supported.data());
++
++      auto ext = std::find_if(supported.begin(), supported.end(), [] (const VkExtensionProperties& p) {
++        return !std::strcmp(p.extensionName, VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
++      });
++      if (ext != supported.end()) {
++        bool requested = std::any_of(extensions.begin(), extensions.end(), [] (const VkExtensionProperties& p) {
++          return !std::strcmp(p.extensionName, VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
++        });
++        if (!requested)
++          extensions.push_back(*ext);
++        Logger::info("Enabling advertised VK_EXT_metal_objects for MetalFX present scaling.");
++      } else {
++        Logger::err("MetalFX requested, but vkEnumerateDeviceExtensionProperties did not advertise VK_EXT_metal_objects.");
++      }
++    }
++
+     for (const auto& extra : m_extraExtensions) {
+       bool found = false;
+ 
+@@ -287,7 +310,12 @@ namespace dxvk {
+     deviceInfo.pEnabledFeatures = &features->features;
+ 
+     VkDevice device = VK_NULL_HANDLE;
+-    VkResult vr = vk->vkCreateDevice(m_handle, &deviceInfo, nullptr, &device);
++    // mevr: device creation through the OpenXR runtime (XR_KHR_vulkan_enable2), see dxvk_instance.cpp.
++    typedef VkResult (*PFN_mevrCreateDevice)(PFN_vkGetInstanceProcAddr, VkPhysicalDevice, const VkDeviceCreateInfo*, VkDevice*);
++    auto mevrCreateDevice = reinterpret_cast<PFN_mevrCreateDevice>(dlsym(RTLD_DEFAULT, "mevr_vk_create_device"));
++    VkResult vr = mevrCreateDevice
++      ? mevrCreateDevice(vk->getLoaderProc(), m_handle, &deviceInfo, &device)
++      : vk->vkCreateDevice(m_handle, &deviceInfo, nullptr, &device);
+ 
+     if (vr) {
+       Logger::err(str::format("Failed to create Vulkan device: ", vr,
+diff --git a/src/dxvk/dxvk_instance.cpp b/src/dxvk/dxvk_instance.cpp
+index a120a212..925da2af 100644
+--- a/src/dxvk/dxvk_instance.cpp
++++ b/src/dxvk/dxvk_instance.cpp
+@@ -1,4 +1,5 @@
+ #include <version.h>
++#include <dlfcn.h>
+ #include <buildenv.h>
+ 
+ #include "dxvk_instance.h"
+@@ -219,6 +220,12 @@ namespace dxvk {
+         extensionsEnabled.insert(ext);
+     }
+ 
++    // MoltenVK is exposed through Vulkan's portability ICD mechanism.
++    for (const auto& ext : extensionsSupported) {
++      if (!std::strcmp(ext.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
++        extensionsEnabled.insert(ext);
++    }
++
+     Logger::info("Enabled instance extensions:");
+ 
+     for (const auto& ext : extensionsEnabled) {
+@@ -250,12 +257,22 @@ namespace dxvk {
+ 
+       VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+       info.pApplicationInfo         = &appInfo;
++      for (const auto& ext : extensionsEnabled) {
++        if (!std::strcmp(ext.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
++          info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
++      }
+       info.enabledLayerCount        = layerNames.size();
+       info.ppEnabledLayerNames      = layerNames.data();
+       info.enabledExtensionCount    = extensionNames.size();
+       info.ppEnabledExtensionNames  = extensionNames.data();
+ 
+-      VkResult status = m_vkl->vkCreateInstance(&info, nullptr, &instance);
++      // mevr: when the host process provides an OpenXR hook, the instance is created by the
++      // OpenXR runtime (XR_KHR_vulkan_enable2) so the session can share it.
++      typedef VkResult (*PFN_mevrCreateInstance)(PFN_vkGetInstanceProcAddr, const VkInstanceCreateInfo*, VkInstance*);
++      auto mevrCreateInstance = reinterpret_cast<PFN_mevrCreateInstance>(dlsym(RTLD_DEFAULT, "mevr_vk_create_instance"));
++      VkResult status = mevrCreateInstance
++        ? mevrCreateInstance(m_vkl->getLoaderProc(), &info, &instance)
++        : m_vkl->vkCreateInstance(&info, nullptr, &instance);
+ 
+       if (status != VK_SUCCESS) {
+         Logger::err("DxvkInstance::createInstance: Failed to create Vulkan instance");
+diff --git a/src/util/util_math.h b/src/util/util_math.h
+index 9276d933..092da871 100644
+--- a/src/util/util_math.h
++++ b/src/util/util_math.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <cmath>
++#include <cstddef>
++#include <stddef.h>
+ 
+ namespace dxvk {
+   

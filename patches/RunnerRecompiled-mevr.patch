@@ -1,0 +1,2245 @@
+diff --git a/pc/runtime/rt_d3d9.c b/pc/runtime/rt_d3d9.c
+index 772fcfa..5bb9142 100644
+--- a/pc/runtime/rt_d3d9.c
++++ b/pc/runtime/rt_d3d9.c
+@@ -460,12 +460,13 @@ void d3d_special_CreateDevice(X86Ctx *ctx)
+         }
+     }
+     host_wait_window(); /* Android: no surface while the screen is off */
+-    uint32_t hr = ((FnCreateDevice)D3D_VT(self)[D3D_IDX_IDirect3D9_CreateDevice])(
++    uint32_t hr = ((FnCreateDevice)D3D_SLOT(self, D3D_IDirect3D9, D3D_IDX_IDirect3D9_CreateDevice))(
+         self, ARG(1), ARG(2), d3d_host_hwnd(ARG(3)), flags | 0x4 /* MULTITHREADED */, &p, &dev);
+     rt_log("D3D9 CreateDevice(adapter %u, type %u, focus %#x -> %p, device window %p, flags %#x) = %#x, device %p",
+            ARG(1), ARG(2), ARG(3), d3d_host_hwnd(ARG(3)), p.hwnd, flags, hr, dev);
+     if (!(hr & 0x80000000u)) pp_out(ARG(5), &p);
+     if (dev) d3d_stat_device(dev);
++    if (dev) d3d_vr_device_created(dev, &p);
+     if (ARG(6)) st32(ARG(6), dev ? d3d_wrap(dev, D3D_IDirect3DDevice9) : 0);
+     /* Without D3DCREATE_FPU_PRESERVE, D3D9 sets the calling thread's x87 to 24-bit precision,
+        round to nearest; the guest's x87 model follows (x87_round). */
+@@ -481,7 +482,7 @@ void d3d_special_Reset(X86Ctx *ctx)
+     HostPresent p;
+     pp_in(ARG(1), &p, 1);
+     host_wait_window();
+-    uint32_t hr = ((FnReset)D3D_VT(self)[D3D_IDX_IDirect3DDevice9_Reset])(self, &p);
++    uint32_t hr = ((FnReset)D3D_SLOT(self, D3D_IDirect3DDevice9, D3D_IDX_IDirect3DDevice9_Reset))(self, &p);
+     if (!(hr & 0x80000000u)) pp_out(ARG(1), &p);
+     RET(hr);
+ }
+@@ -575,7 +576,7 @@ static int extra_mode_format(uint32_t fmt) { return fmt == 22 || fmt == 21; } /*
+ void d3d_special_GetAdapterModeCount(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t n = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_VT(self)[6])(self, ARG(1), ARG(2));
++    uint32_t n = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3D9, 6))(self, ARG(1), ARG(2));
+     RET(n + (extra_mode_format(ARG(2)) ? n_extra_modes() : 0));
+ }
+ 
+@@ -583,7 +584,7 @@ void d3d_special_EnumAdapterModes(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     uint32_t adapter = ARG(1), fmt = ARG(2), idx = ARG(3), out = ARG(4);
+-    uint32_t n = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_VT(self)[6])(self, adapter, fmt);
++    uint32_t n = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3D9, 6))(self, adapter, fmt);
+     if (extra_mode_format(fmt) && idx >= n && idx < n + n_extra_modes()) {
+         uint32_t mw, mh;
+         extra_mode_at(idx - n, &mw, &mh);
+@@ -592,7 +593,7 @@ void d3d_special_EnumAdapterModes(X86Ctx *ctx)
+         RET(0);
+         return;
+     }
+-    RET(((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, void *))D3D_VT(self)[7])(self, adapter, fmt, idx, D3D_PTR(out)));
++    RET(((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3D9, 7))(self, adapter, fmt, idx, D3D_PTR(out)));
+ }
+ 
+ void d3d_special_GetAdapterMonitor(X86Ctx *ctx) { RET(0x00020001u); } /* the HMONITOR USER32 reports */
+@@ -985,3 +986,84 @@ void d3d_trace_draw(void *dev, int kind, uint32_t prim, uint32_t count)
+     if (vs) CALL(vs, 2, DFnRelease);
+     if (rt) CALL(rt, 2, DFnRelease);
+ }
++
++/* ---- VR interposer (mevr, see rt_vr.h) ---- */
++#include "rt_vr.h"
++void *d3d_slot_override[D3D_IFACE_COUNT][D3D_SLOT_MAX];
++static const MevrModule *vr_mod;
++
++static void vr_log(const char *msg) { rt_log("mevr: %s", msg); }
++static void *vr_guest_ptr(uint32_t a) { return a ? rt_ptr(a) : NULL; }
++static int vr_guest_ok(uint32_t a) { return a >= 0x10000 && (rt_vm_is_committed(a) || rt_module_at(a)); }
++
++uint32_t host_pad_get(uint32_t index, uint8_t state[16]);
++
++/* ---- entry hooks and guest calls for the VR module ---- */
++volatile int rt_entry_hooks_on;
++static __thread uint32_t vr_bypass;   /* the next entry of this address runs the original */
++
++int rt_entry_hook(X86Ctx *ctx, uint32_t addr)
++{
++    if (vr_bypass == addr) { vr_bypass = 0; return 0; }
++    return vr_mod && vr_mod->entry_hook ? vr_mod->entry_hook(ctx, addr) : 0;
++}
++static void *vr_thread_ctx(void) { RtThread *t = rt_thread_self(); return t ? &t->ctx : NULL; }
++static void vr_enable_entry_hooks(int on) { rt_entry_hooks_on = on; rt_log("mevr: entry hooks %s", on ? "on" : "off"); }
++static void vr_call_original(void *ctx, uint32_t addr)
++{
++    X86Ctx *c = ctx ? (X86Ctx *)ctx : (X86Ctx *)vr_thread_ctx();
++    if (!c) return;
++    vr_bypass = addr;
++    x86_dispatch(c, addr);
++    vr_bypass = 0;
++}
++static uint32_t vr_call_guest(void *ctx, uint32_t fn, uint32_t ecx, int nargs, const uint32_t *args)
++{
++    X86Ctx *c = ctx ? (X86Ctx *)ctx : (X86Ctx *)vr_thread_ctx();
++    if (!c) return 0;
++    /* eax/ecx/edx are the caller's scratch registers; everything else the callee preserves. */
++    uint32_t saved_ecx = c->ecx, saved_edx = c->edx;
++    c->ecx = ecx;
++    uint32_t r = rt_call(c, fn, nargs, args);
++    c->ecx = saved_ecx; c->edx = saved_edx;
++    return r;
++}
++static uint32_t vr_guest_alloc(uint32_t size) { return rt_heap_alloc(size, 1); }
++static void vr_guest_free(uint32_t addr) { if (addr) rt_heap_free(addr); }
++
++static const MevrHostApi vr_api = {
++    MEVR_API_VERSION,
++    vr_log,
++    &d3d_slot_override[0][0], D3D_IFACE_COUNT, D3D_SLOT_MAX,
++    vr_guest_ptr, vr_guest_ok,
++    host_pad_get,
++    vr_thread_ctx, vr_enable_entry_hooks, vr_call_original, vr_call_guest, vr_guest_alloc, vr_guest_free,
++};
++
++int d3d_vr_audio(const int16_t *lr, uint32_t frames, uint32_t rate)
++{
++    return vr_mod && vr_mod->audio_mixed ? vr_mod->audio_mixed(lr, frames, rate) : 0;
++}
++
++uint32_t d3d_vr_pad_get(uint32_t index, uint8_t state[16])
++{
++    if (vr_mod && vr_mod->pad_get) return vr_mod->pad_get(index, state);
++    return host_pad_get(index, state);
++}
++
++void d3d_vr_attach(const MevrModule *(*attach)(const MevrHostApi *))
++{
++    vr_mod = attach ? attach(&vr_api) : NULL;
++    rt_log("mevr: VR module %s", vr_mod ? "attached" : "refused to attach");
++}
++
++void d3d_vr_d3d9_created(void *host_d3d9)
++{
++    if (vr_mod && vr_mod->d3d9_created) vr_mod->d3d9_created(host_d3d9);
++}
++
++void d3d_vr_device_created(void *host_device, void *present_params)
++{
++    (void)present_params;
++    if (vr_mod && vr_mod->device_created) vr_mod->device_created(host_device);
++}
+diff --git a/pc/runtime/rt_d3d9.h b/pc/runtime/rt_d3d9.h
+index 519c9af..db2786e 100644
+--- a/pc/runtime/rt_d3d9.h
++++ b/pc/runtime/rt_d3d9.h
+@@ -34,6 +34,13 @@ extern const D3dIfaceTable d3d_iface_tables[D3D_IFACE_COUNT];
+ 
+ #define ARG(i) rt_arg(ctx, i)
+ #define D3D_VT(obj) (*(void ***)(obj))
++/* VR interposer (mevr): a loaded VR module may replace any method slot of any interface. The
++   replacement has the method's own host signature and calls the original through D3D_VT(self).
++   NULL = not replaced. This is the recomp's equivalent of the Windows mod's vtable patching. */
++#define D3D_SLOT_MAX 128
++extern void *d3d_slot_override[D3D_IFACE_COUNT][D3D_SLOT_MAX];
++#define D3D_SLOT(obj, iface, idx) (d3d_slot_override[iface][idx] ? d3d_slot_override[iface][idx] : D3D_VT(obj)[idx])
++void d3d_vr_device_created(void *host_device, void *present_params); /* rt_d3d9.c -> mevr, after CreateDevice */
+ #define D3D_PTR(a) ((a) ? rt_ptr(a) : NULL)
+ 
+ void *d3d_host(uint32_t proxy);
+diff --git a/pc/runtime/rt_d3d9_gen.c b/pc/runtime/rt_d3d9_gen.c
+index 8e0d69d..fe1ed4e 100644
+--- a/pc/runtime/rt_d3d9_gen.c
++++ b/pc/runtime/rt_d3d9_gen.c
+@@ -5,84 +5,84 @@
+ static void IDirect3D9_RegisterSoftwareDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[3])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3D9, 3))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_GetAdapterCount(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[4])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3D9, 4))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_GetAdapterDisplayMode(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[8])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3D9, 8))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_CheckDeviceType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_VT(self)[9])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3D9, 9))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_CheckDeviceFormat(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_VT(self)[10])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3D9, 10))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_CheckDeviceMultiSampleType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void *))D3D_VT(self)[11])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), D3D_PTR(ARG(6)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3D9, 11))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), D3D_PTR(ARG(6)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_CheckDepthStencilMatch(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_VT(self)[12])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3D9, 12))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_CheckDeviceFormatConversion(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t))D3D_VT(self)[13])(self, ARG(1), ARG(2), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3D9, 13))(self, ARG(1), ARG(2), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3D9_GetDeviceCaps(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_VT(self)[14])(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3D9, 14))(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_TestCooperativeLevel(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[3])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 3))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetAvailableTextureMem(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[4])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 4))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_EvictManagedResources(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[5])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 5))(self);
+     ctx->eax = r;
+ }
+ 
+@@ -90,7 +90,7 @@ static void IDirect3DDevice9_GetDirect3D(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[6])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 6))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3D9) : 0);
+     ctx->eax = r;
+ }
+@@ -98,34 +98,34 @@ static void IDirect3DDevice9_GetDirect3D(X86Ctx *ctx)
+ static void IDirect3DDevice9_GetDeviceCaps(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[7])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 7))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetDisplayMode(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[8])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 8))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetCursorProperties(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_VT(self)[10])(self, ARG(1), ARG(2), d3d_host(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 10))(self, ARG(1), ARG(2), d3d_host(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetCursorPosition(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_VT(self)[11])(self, ARG(1), ARG(2), ARG(3));
++    ((void (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 11))(self, ARG(1), ARG(2), ARG(3));
+ }
+ 
+ static void IDirect3DDevice9_ShowCursor(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[12])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 12))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+@@ -133,7 +133,7 @@ static void IDirect3DDevice9_GetSwapChain(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[14])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 14))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DSwapChain9) : 0);
+     ctx->eax = r;
+ }
+@@ -141,7 +141,7 @@ static void IDirect3DDevice9_GetSwapChain(X86Ctx *ctx)
+ static void IDirect3DDevice9_GetNumberOfSwapChains(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[15])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 15))(self);
+     ctx->eax = r;
+ }
+ 
+@@ -149,7 +149,7 @@ static void IDirect3DDevice9_Present(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_PRESENT, self);
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *))D3D_VT(self)[17])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), d3d_host_hwnd(ARG(3)), D3D_PTR(ARG(4)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 17))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), d3d_host_hwnd(ARG(3)), D3D_PTR(ARG(4)));
+     ctx->eax = r;
+ }
+ 
+@@ -157,7 +157,7 @@ static void IDirect3DDevice9_GetBackBuffer(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out3 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, void **))D3D_VT(self)[18])(self, ARG(1), ARG(2), ARG(3), &out3);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 18))(self, ARG(1), ARG(2), ARG(3), &out3);
+     if (ARG(4)) st32(ARG(4), out3 ? d3d_wrap(out3, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -165,34 +165,34 @@ static void IDirect3DDevice9_GetBackBuffer(X86Ctx *ctx)
+ static void IDirect3DDevice9_GetRasterStatus(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[19])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 19))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetDialogBoxMode(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[20])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 20))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetGammaRamp(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_VT(self)[21])(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
++    ((void (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 21))(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
+ }
+ 
+ static void IDirect3DDevice9_GetGammaRamp(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[22])(self, ARG(1), D3D_PTR(ARG(2)));
++    ((void (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 22))(self, ARG(1), D3D_PTR(ARG(2)));
+ }
+ 
+ static void IDirect3DDevice9_CreateTexture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out6 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[23])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), &out6, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 23))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), &out6, NULL);
+     if (ARG(7)) st32(ARG(7), out6 ? d3d_wrap(out6, D3D_IDirect3DTexture9) : 0);
+     ctx->eax = r;
+ }
+@@ -201,7 +201,7 @@ static void IDirect3DDevice9_CreateVolumeTexture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out7 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[24])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), ARG(7), &out7, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 24))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), ARG(7), &out7, NULL);
+     if (ARG(8)) st32(ARG(8), out7 ? d3d_wrap(out7, D3D_IDirect3DVolumeTexture9) : 0);
+     ctx->eax = r;
+ }
+@@ -210,7 +210,7 @@ static void IDirect3DDevice9_CreateCubeTexture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out5 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[25])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), &out5, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 25))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), &out5, NULL);
+     if (ARG(6)) st32(ARG(6), out5 ? d3d_wrap(out5, D3D_IDirect3DCubeTexture9) : 0);
+     ctx->eax = r;
+ }
+@@ -219,7 +219,7 @@ static void IDirect3DDevice9_CreateVertexBuffer(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out4 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[26])(self, ARG(1), ARG(2), ARG(3), ARG(4), &out4, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 26))(self, ARG(1), ARG(2), ARG(3), ARG(4), &out4, NULL);
+     if (ARG(5)) st32(ARG(5), out4 ? d3d_wrap(out4, D3D_IDirect3DVertexBuffer9) : 0);
+     ctx->eax = r;
+ }
+@@ -228,7 +228,7 @@ static void IDirect3DDevice9_CreateIndexBuffer(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out4 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[27])(self, ARG(1), ARG(2), ARG(3), ARG(4), &out4, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 27))(self, ARG(1), ARG(2), ARG(3), ARG(4), &out4, NULL);
+     if (ARG(5)) st32(ARG(5), out4 ? d3d_wrap(out4, D3D_IDirect3DIndexBuffer9) : 0);
+     ctx->eax = r;
+ }
+@@ -237,7 +237,7 @@ static void IDirect3DDevice9_CreateRenderTarget(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out6 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[28])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), &out6, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 28))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), &out6, NULL);
+     if (ARG(7)) st32(ARG(7), out6 ? d3d_wrap(out6, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -246,7 +246,7 @@ static void IDirect3DDevice9_CreateDepthStencilSurface(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out6 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[29])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), &out6, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 29))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6), &out6, NULL);
+     if (ARG(7)) st32(ARG(7), out6 ? d3d_wrap(out6, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -254,42 +254,42 @@ static void IDirect3DDevice9_CreateDepthStencilSurface(X86Ctx *ctx)
+ static void IDirect3DDevice9_UpdateSurface(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *))D3D_VT(self)[30])(self, d3d_host(ARG(1)), D3D_PTR(ARG(2)), d3d_host(ARG(3)), D3D_PTR(ARG(4)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 30))(self, d3d_host(ARG(1)), D3D_PTR(ARG(2)), d3d_host(ARG(3)), D3D_PTR(ARG(4)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_UpdateTexture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_VT(self)[31])(self, d3d_host(ARG(1)), d3d_host(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 31))(self, d3d_host(ARG(1)), d3d_host(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetRenderTargetData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_VT(self)[32])(self, d3d_host(ARG(1)), d3d_host(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 32))(self, d3d_host(ARG(1)), d3d_host(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetFrontBufferData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[33])(self, ARG(1), d3d_host(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 33))(self, ARG(1), d3d_host(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_StretchRect(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *, uint32_t))D3D_VT(self)[34])(self, d3d_host(ARG(1)), D3D_PTR(ARG(2)), d3d_host(ARG(3)), D3D_PTR(ARG(4)), ARG(5));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 34))(self, d3d_host(ARG(1)), D3D_PTR(ARG(2)), d3d_host(ARG(3)), D3D_PTR(ARG(4)), ARG(5));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_ColorFill(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t))D3D_VT(self)[35])(self, d3d_host(ARG(1)), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 35))(self, d3d_host(ARG(1)), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+@@ -297,7 +297,7 @@ static void IDirect3DDevice9_CreateOffscreenPlainSurface(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out4 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_VT(self)[36])(self, ARG(1), ARG(2), ARG(3), ARG(4), &out4, NULL);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void **, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 36))(self, ARG(1), ARG(2), ARG(3), ARG(4), &out4, NULL);
+     if (ARG(5)) st32(ARG(5), out4 ? d3d_wrap(out4, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -305,7 +305,7 @@ static void IDirect3DDevice9_CreateOffscreenPlainSurface(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetRenderTarget(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[37])(self, ARG(1), d3d_host(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 37))(self, ARG(1), d3d_host(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -313,7 +313,7 @@ static void IDirect3DDevice9_GetRenderTarget(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[38])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 38))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -321,7 +321,7 @@ static void IDirect3DDevice9_GetRenderTarget(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetDepthStencilSurface(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[39])(self, d3d_host(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 39))(self, d3d_host(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -329,7 +329,7 @@ static void IDirect3DDevice9_GetDepthStencilSurface(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[40])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 40))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -338,14 +338,14 @@ static void IDirect3DDevice9_BeginScene(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_SCENE, self);
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[41])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 41))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_EndScene(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[42])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 42))(self);
+     ctx->eax = r;
+ }
+ 
+@@ -353,112 +353,112 @@ static void IDirect3DDevice9_Clear(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_CLEAR, self);
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t, uint32_t, float, uint32_t))D3D_VT(self)[43])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3), ARG(4), u2f(ARG(5)), ARG(6));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t, uint32_t, float, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 43))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3), ARG(4), u2f(ARG(5)), ARG(6));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetTransform(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[44])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 44))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetTransform(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[45])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 45))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_MultiplyTransform(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[46])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 46))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetViewport(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[47])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 47))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetViewport(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[48])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 48))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetMaterial(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[49])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 49))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetMaterial(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[50])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 50))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetLight(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[51])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 51))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetLight(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[52])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 52))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_LightEnable(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_VT(self)[53])(self, ARG(1), ARG(2));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 53))(self, ARG(1), ARG(2));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetLightEnable(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[54])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 54))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetClipPlane(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[55])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 55))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetClipPlane(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[56])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 56))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetRenderState(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_VT(self)[57])(self, ARG(1), ARG(2));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 57))(self, ARG(1), ARG(2));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetRenderState(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[58])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 58))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -466,7 +466,7 @@ static void IDirect3DDevice9_CreateStateBlock(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[59])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 59))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DStateBlock9) : 0);
+     ctx->eax = r;
+ }
+@@ -474,7 +474,7 @@ static void IDirect3DDevice9_CreateStateBlock(X86Ctx *ctx)
+ static void IDirect3DDevice9_BeginStateBlock(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[60])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 60))(self);
+     ctx->eax = r;
+ }
+ 
+@@ -482,7 +482,7 @@ static void IDirect3DDevice9_EndStateBlock(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[61])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 61))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DStateBlock9) : 0);
+     ctx->eax = r;
+ }
+@@ -490,14 +490,14 @@ static void IDirect3DDevice9_EndStateBlock(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetClipStatus(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[62])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 62))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetClipStatus(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[63])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 63))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -505,7 +505,7 @@ static void IDirect3DDevice9_GetTexture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[64])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 64))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DBaseTexture9) : 0);
+     ctx->eax = r;
+ }
+@@ -513,112 +513,112 @@ static void IDirect3DDevice9_GetTexture(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetTexture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[65])(self, ARG(1), d3d_host(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 65))(self, ARG(1), d3d_host(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetTextureStageState(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_VT(self)[66])(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 66))(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetTextureStageState(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_VT(self)[67])(self, ARG(1), ARG(2), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 67))(self, ARG(1), ARG(2), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetSamplerState(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_VT(self)[68])(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 68))(self, ARG(1), ARG(2), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetSamplerState(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_VT(self)[69])(self, ARG(1), ARG(2), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 69))(self, ARG(1), ARG(2), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_ValidateDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[70])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 70))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetPaletteEntries(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[71])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 71))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetPaletteEntries(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[72])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 72))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetCurrentTexturePalette(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[73])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 73))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetCurrentTexturePalette(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[74])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 74))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetScissorRect(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[75])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 75))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetScissorRect(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[76])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 76))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetSoftwareVertexProcessing(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[77])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 77))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetSoftwareVertexProcessing(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[78])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 78))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetNPatchMode(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, float))D3D_VT(self)[79])(self, u2f(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, float))D3D_SLOT(self, D3D_IDirect3DDevice9, 79))(self, u2f(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetNPatchMode(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    float r = ((float (D3D_CALL *)(void *))D3D_VT(self)[80])(self);
++    float r = ((float (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 80))(self);
+     x87_push(ctx, (double)r); /* float results come back in ST(0) */
+ }
+ 
+@@ -627,7 +627,7 @@ static void IDirect3DDevice9_DrawPrimitive(X86Ctx *ctx)
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_DRAW, self);
+     d3d_trace_draw(self, 0, ARG(1), ARG(3));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_VT(self)[81])(self, ARG(1), ARG(2), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 81))(self, ARG(1), ARG(2), ARG(3));
+     ctx->eax = r;
+ }
+ 
+@@ -636,7 +636,7 @@ static void IDirect3DDevice9_DrawIndexedPrimitive(X86Ctx *ctx)
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_DRAW, self);
+     d3d_trace_draw(self, 1, ARG(1), ARG(6));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_VT(self)[82])(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 82))(self, ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6));
+     ctx->eax = r;
+ }
+ 
+@@ -645,7 +645,7 @@ static void IDirect3DDevice9_DrawPrimitiveUP(X86Ctx *ctx)
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_DRAW, self);
+     d3d_trace_draw(self, 2, ARG(1), ARG(2));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *, uint32_t))D3D_VT(self)[83])(self, ARG(1), ARG(2), D3D_PTR(ARG(3)), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 83))(self, ARG(1), ARG(2), D3D_PTR(ARG(3)), ARG(4));
+     ctx->eax = r;
+ }
+ 
+@@ -654,14 +654,14 @@ static void IDirect3DDevice9_DrawIndexedPrimitiveUP(X86Ctx *ctx)
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_DRAW, self);
+     d3d_trace_draw(self, 3, ARG(1), ARG(4));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void *, uint32_t, void *, uint32_t))D3D_VT(self)[84])(self, ARG(1), ARG(2), ARG(3), ARG(4), D3D_PTR(ARG(5)), ARG(6), D3D_PTR(ARG(7)), ARG(8));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, uint32_t, void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 84))(self, ARG(1), ARG(2), ARG(3), ARG(4), D3D_PTR(ARG(5)), ARG(6), D3D_PTR(ARG(7)), ARG(8));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_ProcessVertices(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, void *, void *, uint32_t))D3D_VT(self)[85])(self, ARG(1), ARG(2), ARG(3), d3d_host(ARG(4)), d3d_host(ARG(5)), ARG(6));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, uint32_t, void *, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 85))(self, ARG(1), ARG(2), ARG(3), d3d_host(ARG(4)), d3d_host(ARG(5)), ARG(6));
+     ctx->eax = r;
+ }
+ 
+@@ -669,7 +669,7 @@ static void IDirect3DDevice9_CreateVertexDeclaration(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void **))D3D_VT(self)[86])(self, D3D_PTR(ARG(1)), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 86))(self, D3D_PTR(ARG(1)), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DVertexDeclaration9) : 0);
+     ctx->eax = r;
+ }
+@@ -677,7 +677,7 @@ static void IDirect3DDevice9_CreateVertexDeclaration(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetVertexDeclaration(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[87])(self, d3d_host(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 87))(self, d3d_host(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -685,7 +685,7 @@ static void IDirect3DDevice9_GetVertexDeclaration(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[88])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 88))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DVertexDeclaration9) : 0);
+     ctx->eax = r;
+ }
+@@ -693,14 +693,14 @@ static void IDirect3DDevice9_GetVertexDeclaration(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetFVF(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[89])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 89))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetFVF(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[90])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 90))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -708,7 +708,7 @@ static void IDirect3DDevice9_CreateVertexShader(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void **))D3D_VT(self)[91])(self, D3D_PTR(ARG(1)), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 91))(self, D3D_PTR(ARG(1)), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DVertexShader9) : 0);
+     ctx->eax = r;
+ }
+@@ -716,7 +716,7 @@ static void IDirect3DDevice9_CreateVertexShader(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetVertexShader(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[92])(self, d3d_host(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 92))(self, d3d_host(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -724,7 +724,7 @@ static void IDirect3DDevice9_GetVertexShader(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[93])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 93))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DVertexShader9) : 0);
+     ctx->eax = r;
+ }
+@@ -732,49 +732,49 @@ static void IDirect3DDevice9_GetVertexShader(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetVertexShaderConstantF(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[94])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 94))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetVertexShaderConstantF(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[95])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 95))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetVertexShaderConstantI(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[96])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 96))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetVertexShaderConstantI(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[97])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 97))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetVertexShaderConstantB(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[98])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 98))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetVertexShaderConstantB(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[99])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 99))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetStreamSource(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t, uint32_t))D3D_VT(self)[100])(self, ARG(1), d3d_host(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 100))(self, ARG(1), d3d_host(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+@@ -782,7 +782,7 @@ static void IDirect3DDevice9_GetStreamSource(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **, void *, void *))D3D_VT(self)[101])(self, ARG(1), &out1, D3D_PTR(ARG(3)), D3D_PTR(ARG(4)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 101))(self, ARG(1), &out1, D3D_PTR(ARG(3)), D3D_PTR(ARG(4)));
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DVertexBuffer9) : 0);
+     ctx->eax = r;
+ }
+@@ -790,21 +790,21 @@ static void IDirect3DDevice9_GetStreamSource(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetStreamSourceFreq(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_VT(self)[102])(self, ARG(1), ARG(2));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 102))(self, ARG(1), ARG(2));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetStreamSourceFreq(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[103])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 103))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetIndices(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[104])(self, d3d_host(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 104))(self, d3d_host(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -812,7 +812,7 @@ static void IDirect3DDevice9_GetIndices(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[105])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 105))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DIndexBuffer9) : 0);
+     ctx->eax = r;
+ }
+@@ -821,7 +821,7 @@ static void IDirect3DDevice9_CreatePixelShader(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void **))D3D_VT(self)[106])(self, D3D_PTR(ARG(1)), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 106))(self, D3D_PTR(ARG(1)), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DPixelShader9) : 0);
+     ctx->eax = r;
+ }
+@@ -829,7 +829,7 @@ static void IDirect3DDevice9_CreatePixelShader(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetPixelShader(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[107])(self, d3d_host(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 107))(self, d3d_host(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -837,7 +837,7 @@ static void IDirect3DDevice9_GetPixelShader(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[108])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 108))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DPixelShader9) : 0);
+     ctx->eax = r;
+ }
+@@ -845,63 +845,63 @@ static void IDirect3DDevice9_GetPixelShader(X86Ctx *ctx)
+ static void IDirect3DDevice9_SetPixelShaderConstantF(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[109])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 109))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetPixelShaderConstantF(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[110])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 110))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetPixelShaderConstantI(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[111])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 111))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetPixelShaderConstantI(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[112])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 112))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_SetPixelShaderConstantB(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[113])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 113))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_GetPixelShaderConstantB(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_VT(self)[114])(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 114))(self, ARG(1), D3D_PTR(ARG(2)), ARG(3));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_DrawRectPatch(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, void *))D3D_VT(self)[115])(self, ARG(1), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 115))(self, ARG(1), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_DrawTriPatch(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, void *))D3D_VT(self)[116])(self, ARG(1), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *, void *))D3D_SLOT(self, D3D_IDirect3DDevice9, 116))(self, ARG(1), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DDevice9_DeletePatch(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[117])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DDevice9, 117))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+@@ -909,7 +909,7 @@ static void IDirect3DDevice9_CreateQuery(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[118])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DDevice9, 118))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DQuery9) : 0);
+     ctx->eax = r;
+ }
+@@ -918,14 +918,14 @@ static void IDirect3DSwapChain9_Present(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     d3d_stat(D3D_STAT_PRESENT, self);
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *, uint32_t))D3D_VT(self)[3])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), d3d_host_hwnd(ARG(3)), D3D_PTR(ARG(4)), ARG(5));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *, void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DSwapChain9, 3))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), d3d_host_hwnd(ARG(3)), D3D_PTR(ARG(4)), ARG(5));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSwapChain9_GetFrontBufferData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[4])(self, d3d_host(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DSwapChain9, 4))(self, d3d_host(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -933,7 +933,7 @@ static void IDirect3DSwapChain9_GetBackBuffer(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out2 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void **))D3D_VT(self)[5])(self, ARG(1), ARG(2), &out2);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DSwapChain9, 5))(self, ARG(1), ARG(2), &out2);
+     if (ARG(3)) st32(ARG(3), out2 ? d3d_wrap(out2, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -941,14 +941,14 @@ static void IDirect3DSwapChain9_GetBackBuffer(X86Ctx *ctx)
+ static void IDirect3DSwapChain9_GetRasterStatus(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DSwapChain9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSwapChain9_GetDisplayMode(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[7])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DSwapChain9, 7))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -956,7 +956,7 @@ static void IDirect3DSwapChain9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[8])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DSwapChain9, 8))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -965,7 +965,7 @@ static void IDirect3DSurface9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DSurface9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -973,55 +973,55 @@ static void IDirect3DSurface9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DSurface9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DSurface9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSurface9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DSurface9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSurface9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DSurface9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSurface9_SetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[7])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DSurface9, 7))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSurface9_GetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[8])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DSurface9, 8))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSurface9_PreLoad(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[9])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DSurface9, 9))(self);
+ }
+ 
+ static void IDirect3DSurface9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[10])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DSurface9, 10))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DSurface9_GetDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[12])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DSurface9, 12))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -1029,7 +1029,7 @@ static void IDirect3DVolume9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DVolume9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1037,28 +1037,28 @@ static void IDirect3DVolume9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DVolume9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DVolume9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolume9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DVolume9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolume9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DVolume9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolume9_GetDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[8])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DVolume9, 8))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -1066,7 +1066,7 @@ static void IDirect3DVertexBuffer9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1074,55 +1074,55 @@ static void IDirect3DVertexBuffer9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DVertexBuffer9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVertexBuffer9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVertexBuffer9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVertexBuffer9_SetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[7])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 7))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVertexBuffer9_GetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[8])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 8))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVertexBuffer9_PreLoad(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[9])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 9))(self);
+ }
+ 
+ static void IDirect3DVertexBuffer9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[10])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 10))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVertexBuffer9_GetDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[13])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DVertexBuffer9, 13))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -1130,7 +1130,7 @@ static void IDirect3DIndexBuffer9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1138,55 +1138,55 @@ static void IDirect3DIndexBuffer9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DIndexBuffer9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DIndexBuffer9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DIndexBuffer9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DIndexBuffer9_SetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[7])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 7))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DIndexBuffer9_GetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[8])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 8))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DIndexBuffer9_PreLoad(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[9])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 9))(self);
+ }
+ 
+ static void IDirect3DIndexBuffer9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[10])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 10))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DIndexBuffer9_GetDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[13])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DIndexBuffer9, 13))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -1194,7 +1194,7 @@ static void IDirect3DTexture9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DTexture9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1202,96 +1202,96 @@ static void IDirect3DTexture9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DTexture9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DTexture9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_SetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[7])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DTexture9, 7))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_GetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[8])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 8))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_PreLoad(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[9])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 9))(self);
+ }
+ 
+ static void IDirect3DTexture9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[10])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 10))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_SetLOD(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[11])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DTexture9, 11))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_GetLOD(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[12])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 12))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_GetLevelCount(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[13])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 13))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_SetAutoGenFilterType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[14])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DTexture9, 14))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_GetAutoGenFilterType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[15])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 15))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DTexture9_GenerateMipSubLevels(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[16])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 16))(self);
+ }
+ 
+ static void IDirect3DTexture9_GetLevelDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[17])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 17))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1299,7 +1299,7 @@ static void IDirect3DTexture9_GetSurfaceLevel(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[18])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DTexture9, 18))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -1307,7 +1307,7 @@ static void IDirect3DTexture9_GetSurfaceLevel(X86Ctx *ctx)
+ static void IDirect3DTexture9_AddDirtyRect(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[21])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DTexture9, 21))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -1315,7 +1315,7 @@ static void IDirect3DCubeTexture9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1323,96 +1323,96 @@ static void IDirect3DCubeTexture9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DCubeTexture9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_SetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[7])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 7))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_GetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[8])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 8))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_PreLoad(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[9])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 9))(self);
+ }
+ 
+ static void IDirect3DCubeTexture9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[10])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 10))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_SetLOD(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[11])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 11))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_GetLOD(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[12])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 12))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_GetLevelCount(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[13])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 13))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_SetAutoGenFilterType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[14])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 14))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_GetAutoGenFilterType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[15])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 15))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DCubeTexture9_GenerateMipSubLevels(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[16])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 16))(self);
+ }
+ 
+ static void IDirect3DCubeTexture9_GetLevelDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[17])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 17))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1420,7 +1420,7 @@ static void IDirect3DCubeTexture9_GetCubeMapSurface(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out2 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void **))D3D_VT(self)[18])(self, ARG(1), ARG(2), &out2);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 18))(self, ARG(1), ARG(2), &out2);
+     if (ARG(3)) st32(ARG(3), out2 ? d3d_wrap(out2, D3D_IDirect3DSurface9) : 0);
+     ctx->eax = r;
+ }
+@@ -1428,7 +1428,7 @@ static void IDirect3DCubeTexture9_GetCubeMapSurface(X86Ctx *ctx)
+ static void IDirect3DCubeTexture9_AddDirtyRect(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[21])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DCubeTexture9, 21))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1436,7 +1436,7 @@ static void IDirect3DVolumeTexture9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1444,96 +1444,96 @@ static void IDirect3DVolumeTexture9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DVolumeTexture9_SetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), ARG(3), ARG(4));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetPrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_VT(self)[5])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 5))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)), D3D_PTR(ARG(3)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_FreePrivateData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[6])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 6))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_SetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[7])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 7))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetPriority(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[8])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 8))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_PreLoad(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[9])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 9))(self);
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[10])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 10))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_SetLOD(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[11])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 11))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetLOD(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[12])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 12))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetLevelCount(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[13])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 13))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_SetAutoGenFilterType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[14])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 14))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetAutoGenFilterType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[15])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 15))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DVolumeTexture9_GenerateMipSubLevels(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    ((void (D3D_CALL *)(void *))D3D_VT(self)[16])(self);
++    ((void (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 16))(self);
+ }
+ 
+ static void IDirect3DVolumeTexture9_GetLevelDesc(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_VT(self)[17])(self, ARG(1), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 17))(self, ARG(1), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1541,7 +1541,7 @@ static void IDirect3DVolumeTexture9_GetVolumeLevel(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out1 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_VT(self)[18])(self, ARG(1), &out1);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t, void **))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 18))(self, ARG(1), &out1);
+     if (ARG(2)) st32(ARG(2), out1 ? d3d_wrap(out1, D3D_IDirect3DVolume9) : 0);
+     ctx->eax = r;
+ }
+@@ -1549,7 +1549,7 @@ static void IDirect3DVolumeTexture9_GetVolumeLevel(X86Ctx *ctx)
+ static void IDirect3DVolumeTexture9_AddDirtyBox(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_VT(self)[21])(self, D3D_PTR(ARG(1)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *))D3D_SLOT(self, D3D_IDirect3DVolumeTexture9, 21))(self, D3D_PTR(ARG(1)));
+     ctx->eax = r;
+ }
+ 
+@@ -1557,7 +1557,7 @@ static void IDirect3DVertexDeclaration9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DVertexDeclaration9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1565,7 +1565,7 @@ static void IDirect3DVertexDeclaration9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DVertexDeclaration9_GetDeclaration(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DVertexDeclaration9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1573,7 +1573,7 @@ static void IDirect3DVertexShader9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DVertexShader9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1581,7 +1581,7 @@ static void IDirect3DVertexShader9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DVertexShader9_GetFunction(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DVertexShader9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1589,7 +1589,7 @@ static void IDirect3DPixelShader9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DPixelShader9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1597,7 +1597,7 @@ static void IDirect3DPixelShader9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DPixelShader9_GetFunction(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_VT(self)[4])(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, void *))D3D_SLOT(self, D3D_IDirect3DPixelShader9, 4))(self, D3D_PTR(ARG(1)), D3D_PTR(ARG(2)));
+     ctx->eax = r;
+ }
+ 
+@@ -1605,7 +1605,7 @@ static void IDirect3DStateBlock9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DStateBlock9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1613,14 +1613,14 @@ static void IDirect3DStateBlock9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DStateBlock9_Capture(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[4])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DStateBlock9, 4))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DStateBlock9_Apply(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[5])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DStateBlock9, 5))(self);
+     ctx->eax = r;
+ }
+ 
+@@ -1628,7 +1628,7 @@ static void IDirect3DQuery9_GetDevice(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+     void *out0 = NULL;
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_VT(self)[3])(self, &out0);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void **))D3D_SLOT(self, D3D_IDirect3DQuery9, 3))(self, &out0);
+     if (ARG(1)) st32(ARG(1), out0 ? d3d_wrap(out0, D3D_IDirect3DDevice9) : 0);
+     ctx->eax = r;
+ }
+@@ -1636,28 +1636,28 @@ static void IDirect3DQuery9_GetDevice(X86Ctx *ctx)
+ static void IDirect3DQuery9_GetType(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[4])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DQuery9, 4))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DQuery9_GetDataSize(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_VT(self)[5])(self);
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *))D3D_SLOT(self, D3D_IDirect3DQuery9, 5))(self);
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DQuery9_Issue(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_VT(self)[6])(self, ARG(1));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, uint32_t))D3D_SLOT(self, D3D_IDirect3DQuery9, 6))(self, ARG(1));
+     ctx->eax = r;
+ }
+ 
+ static void IDirect3DQuery9_GetData(X86Ctx *ctx)
+ {
+     void *self = d3d_host(ARG(0));
+-    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, uint32_t, uint32_t))D3D_VT(self)[7])(self, D3D_PTR(ARG(1)), ARG(2), ARG(3));
++    uint32_t r = ((uint32_t (D3D_CALL *)(void *, void *, uint32_t, uint32_t))D3D_SLOT(self, D3D_IDirect3DQuery9, 7))(self, D3D_PTR(ARG(1)), ARG(2), ARG(3));
+     d3d_query_stat(self, r, ARG(1), ARG(2), ARG(3));
+     ctx->eax = r;
+ }
+diff --git a/pc/runtime/rt_dinput.c b/pc/runtime/rt_dinput.c
+index 45b2bf3..76a830b 100644
+--- a/pc/runtime/rt_dinput.c
++++ b/pc/runtime/rt_dinput.c
+@@ -4,6 +4,7 @@
+    Windows the mouse is captured and read relative, host_mouse_poll); no buffered events, no joysticks (pads go
+    through XInput). */
+ #include "rt.h"
++#include "rt_vr.h"
+ 
+ #include <stdlib.h>
+ #include <string.h>
+@@ -201,7 +202,7 @@ static void i_DirectInput8Create(X86Ctx *ctx)
+ static void x_GetState(X86Ctx *ctx)
+ {
+     uint8_t st[16];
+-    uint32_t r = host_pad_get(ARG(0), st);
++    uint32_t r = d3d_vr_pad_get(ARG(0), st); /* the VR module's motion controllers, or the host pad */
+     if (r == 0 && ARG(1)) memcpy(rt_ptr(ARG(1)), st, 16);
+     RET(r);
+ }
+diff --git a/pc/runtime/rt_host_macos.c b/pc/runtime/rt_host_macos.c
+index ace61fb..331f521 100644
+--- a/pc/runtime/rt_host_macos.c
++++ b/pc/runtime/rt_host_macos.c
+@@ -38,6 +38,7 @@
+ #include <time.h>
+ #include <unistd.h>
+ #include "rt.h"
++#include "rt_vr.h"
+ 
+ #define HOST_PAGE 0x4000u /* arm64 macOS; the spike measured it with getpagesize() */
+ 
+@@ -333,6 +334,16 @@ void *host_d3d9_create(uint32_t sdk_version)
+         if (access(icdb, R_OK) == 0) icd = icdb;
+     }
+     if (!getenv("VK_ICD_FILENAMES") && !getenv("VK_DRIVER_FILES") && access(icd, R_OK) == 0) setenv("VK_ICD_FILENAMES", icd, 0);
++    {   /* VR module (ME_VR=<path to libmevr.dylib>): loaded first and RTLD_GLOBAL, so the
++           patched DXVK finds its mevr_vk_create_* hooks and creates Vulkan through OpenXR. */
++        static int vr_tried; /* Direct3DCreate9 runs twice per start: load the module once */
++        const char *vr = getenv("ME_VR");
++        if (vr && *vr && !vr_tried++) {
++            void *vl = dlopen(vr, RTLD_NOW | RTLD_GLOBAL);
++            if (!vl) rt_log("mevr: cannot load %s: %s", vr, dlerror());
++            else d3d_vr_attach((const MevrModule *(*)(const MevrHostApi *))dlsym(vl, "mevr_attach"));
++        }
++    }
+     const char *want = getenv("ME_PC_DXVK");
+     void *lib = want ? dlopen(want, RTLD_NOW) : NULL;
+     if (!lib) lib = dlopen("libdxvk_d3d9.dylib", RTLD_NOW);
+@@ -341,7 +352,9 @@ void *host_d3d9_create(uint32_t sdk_version)
+     void (*set_hold)(void (*)(int)) = (void (*)(void (*)(int)))dlsym(lib, "dxvk_warm_set_hold_callback");
+     if (set_hold) set_hold(host_stall_hook); /* absent in an ordinary DXVK */
+     void *(*create)(uint32_t) = (void *(*)(uint32_t))dlsym(lib, "Direct3DCreate9");
+-    return create ? create(sdk_version) : NULL;
++    void *d3d = create ? create(sdk_version) : NULL;
++    if (d3d) d3d_vr_d3d9_created(d3d);
++    return d3d;
+ }
+ 
+ /* ---- windows and messages ---- */
+@@ -850,6 +863,7 @@ void host_profile_start(void) {}
+ 
+ /* ---- audio: an SDL3 playback stream, the runtime's mixer as the source ---- */
+ static void (*audio_mix)(int16_t *out, uint32_t frames);
++static uint32_t audio_rate = 44100;
+ 
+ static void SDLCALL audio_cb(void *user, SDL_AudioStream *stream, int additional, int total)
+ {
+@@ -861,6 +875,7 @@ static void SDLCALL audio_cb(void *user, SDL_AudioStream *stream, int additional
+         if (!frames) break;
+         if (host_stall_audio_muted()) memset(buf, 0, frames * 4); /* a compile stall: the game's audio waits too */
+         else audio_mix(buf, frames);
++        if (d3d_vr_audio(buf, frames, audio_rate)) memset(buf, 0, frames * 4); /* playing in the headset */
+         SDL_PutAudioStreamData(stream, buf, (int)(frames * 4));
+         additional -= (int)(frames * 4);
+     }
+@@ -869,6 +884,7 @@ static void SDLCALL audio_cb(void *user, SDL_AudioStream *stream, int additional
+ int host_audio_start(uint32_t rate, void (*mix)(int16_t *out, uint32_t frames))
+ {
+     audio_mix = mix;
++    audio_rate = rate;
+     SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, (int)rate};
+     SDL_AudioStream *s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_cb, NULL);
+     if (!s) { rt_log("audio: SDL_OpenAudioDeviceStream failed: %s", SDL_GetError()); return 0; }
+diff --git a/pc/runtime/rt_vr.h b/pc/runtime/rt_vr.h
+new file mode 100644
+index 0000000..0f4a096
+--- /dev/null
++++ b/pc/runtime/rt_vr.h
+@@ -0,0 +1,68 @@
++/* C ABI between the runtime and an optional VR module (libmevr.dylib, ME_VR=<path>).
++
++   The runtime loads the module before DXVK, calls mevr_attach() with this host API, and then
++   calls back into the module at the points listed in MevrModule. The module intercepts
++   Direct3D 9 by filling slots of the override table (rt_d3d9.h: d3d_slot_override), the
++   recomp's equivalent of patching a COM vtable: a replacement has the method's host signature
++   and calls the original through the object's own vtable. Guest memory is reached through
++   guest_ptr (the game's 32-bit addresses are unchanged by the lift). */
++#ifndef RT_VR_H
++#define RT_VR_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define MEVR_API_VERSION 4
++
++typedef struct MevrHostApi {
++    uint32_t version;
++    void (*log)(const char *msg);
++    /* d3d_slot_override as a flat array: slot_override[iface * slot_max + index] */
++    void **slot_override;
++    uint32_t iface_count, slot_max;
++    void *(*guest_ptr)(uint32_t guest_address);   /* host pointer for a guest address (NULL for 0) */
++    int (*guest_ok)(uint32_t guest_address);      /* address is committed guest memory or a module */
++    uint32_t (*pad_real)(uint32_t index, uint8_t state[16]); /* the physical pad as XInputGetState sees it */
++    /* Game code. ctx is the calling guest thread's X86Ctx (NULL = this thread's own). */
++    void *(*thread_ctx)(void);                      /* this thread's X86Ctx, NULL off guest threads */
++    void (*enable_entry_hooks)(int on);             /* lift.py ENTRY_HOOKS start asking entry_hook */
++    /* Runs the function at addr for the call now at its entry (inside entry_hook: esp at the
++       return address, arguments above it), skipping the entry hook once; esp/eax as on return. */
++    void (*call_original)(void *ctx, uint32_t addr);
++    /* Calls game code: thiscall when ecx != 0, stdcall arguments; returns eax. */
++    uint32_t (*call_guest)(void *ctx, uint32_t fn, uint32_t ecx, int nargs, const uint32_t *args);
++    uint32_t (*guest_alloc)(uint32_t size);         /* guest heap memory (zeroed), for call arguments */
++    void (*guest_free)(uint32_t addr);
++} MevrHostApi;
++
++typedef struct MevrModule {
++    uint32_t version;
++    void (*device_created)(void *host_device);    /* IDirect3DDevice9 (DXVK) just created */
++    void (*d3d9_created)(void *host_d3d9);        /* IDirect3D9 (DXVK) just created (twice per start) */
++    /* XInputGetState for the game (XINPUT_STATE, 16 bytes); NULL = the physical pad only */
++    uint32_t (*pad_get)(uint32_t index, uint8_t state[16]);
++    /* An ENTRY_HOOKS function was called: return 1 when the call was handled (call_original
++       or an emulated return), 0 to let the function run normally. */
++    int (*entry_hook)(void *ctx, uint32_t addr);
++    /* The game's final audio mix (interleaved stereo s16 at rate), every host audio callback.
++       Return nonzero to silence the local output (the module plays it elsewhere, e.g. the headset). */
++    int (*audio_mixed)(const int16_t *lr, uint32_t frames, uint32_t rate);
++} MevrModule;
++
++/* Exported by the module. */
++typedef const MevrModule *(*MevrAttachFn)(const MevrHostApi *api);
++
++/* Runtime side (rt_d3d9.c). */
++void d3d_vr_attach(const MevrModule *(*attach)(const MevrHostApi *));
++void d3d_vr_d3d9_created(void *host_d3d9);
++uint32_t d3d_vr_pad_get(uint32_t index, uint8_t state[16]); /* rt_dinput.c */
++int d3d_vr_audio(const int16_t *lr, uint32_t frames, uint32_t rate); /* rt_host_*.c audio callback */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/pc/runtime/x86rt.h b/pc/runtime/x86rt.h
+index 5416ab1..5ae04e6 100644
+--- a/pc/runtime/x86rt.h
++++ b/pc/runtime/x86rt.h
+@@ -430,6 +430,10 @@ static inline float sse_max(float a, float b) { return a > b ? a : b; }
+ 
+ /* Services the generated code calls; provided by the runtime (or the test harness). */
+ void x86_dispatch(X86Ctx *ctx, uint32_t target);      /* indirect call/jmp: guest address -> lifted fn */
++/* Entry hooks (lift.py ENTRY_HOOKS): nonzero once a VR module registered one; rt_entry_hook returns
++   1 when the hook ran the call (the function then returns at once, esp/eax already set). */
++extern volatile int rt_entry_hooks_on;
++int rt_entry_hook(X86Ctx *ctx, uint32_t addr);
+ void x86_trap(X86Ctx *ctx, uint32_t addr, const char *why) __attribute__((noreturn));
+ /* cpuid: the runtime reports the processor the guest sees (leaf in *eax, subleaf in *ecx). */
+ void x86_cpuid(X86Ctx *ctx, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
+diff --git a/pc/tools/gen_d3d9_bridge.py b/pc/tools/gen_d3d9_bridge.py
+index 3300857..99e20f6 100644
+--- a/pc/tools/gen_d3d9_bridge.py
++++ b/pc/tools/gen_d3d9_bridge.py
+@@ -158,7 +158,7 @@ def main():
+                     pre.append(f"void *out{i} = NULL;")
+                     post.append(f"if ({a}) st32({a}, out{i} ? d3d_wrap(out{i}, D3D_{t}) : 0);")
+             rtype = "float" if rk == "float" else "uint32_t"
+-            fn = f"(({rtype} (D3D_CALL *)({', '.join(ctypes)}))D3D_VT(self)[{idx}])"
++            fn = f"(({rtype} (D3D_CALL *)({', '.join(ctypes)}))D3D_SLOT(self, D3D_{name}, {idx}))"
+             body = [f"static void {sym}(X86Ctx *ctx)", "{", "    void *self = d3d_host(ARG(0));"]
+             if (name, mname) in COUNTED:
+                 body.append(f"    d3d_stat(D3D_STAT_{COUNTED[(name, mname)]}, self);")
+diff --git a/pc/tools/lift.py b/pc/tools/lift.py
+index 6fa41bf..ac496a0 100644
+--- a/pc/tools/lift.py
++++ b/pc/tools/lift.py
+@@ -116,6 +116,11 @@ SCRIPT_CALL = 0x01148D50
+ # UMultiFont::GetResolutionTestTableIndex of the same exe: above 1920 wide it falls back to the
+ # smallest font page; rt_ue_font_page answers for that case (rt_ue3.c).
+ FONT_PAGE = 0x00E75A50
++# Functions of the GOG MirrorsEdge.exe that an optional VR module (rt_vr.h) may take over at
++# entry, where the Windows mod detoured them: TdPawn.Update1pArms (native exec),
++# USkeletalMeshComponent::UpdateSkelPose, and the script interpreter (SCRIPT_CALL). The check
++# is one load of a flag that stays 0 unless a module registered a hook.
++ENTRY_HOOKS = {0x011A9700, 0x00D235C0, SCRIPT_CALL}
+ 
+ 
+ def ebp_frame(insns, entry):
+@@ -312,6 +317,8 @@ class FnLifter:
+             self.e("rt_ue_script_call(ctx);")
+         if self.entry == FONT_PAGE:
+             self.e("if (rt_ue_font_page(ctx)) return;")
++        if self.entry in ENTRY_HOOKS:
++            self.e(f"if (__builtin_expect(rt_entry_hooks_on, 0) && rt_entry_hook(ctx, 0x{self.entry:X}u)) return;")
+         if resume:
+             # The EH runtime jumps here with ebp/esp of this frame (x86_resume_jump in rt_core.c).
+             ts = ", ".join(f"0x{t:X}u" for t in resume)

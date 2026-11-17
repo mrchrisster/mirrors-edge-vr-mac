@@ -1,0 +1,8 @@
+# Upstream checkouts and everything built from them or from the game stay local.
+RunnerRecompiled/
+vr-mod/
+deps/
+mevr-mac/build/
+mevr-mac/gen/
+*.ppm
+*.log

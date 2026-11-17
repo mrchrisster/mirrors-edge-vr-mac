@@ -1,0 +1,217 @@
+diff --git a/clients/android-vr/app/src/main/cpp/CMakeLists.txt b/clients/android-vr/app/src/main/cpp/CMakeLists.txt
+index 195a2fc..e38de8e 100644
+--- a/clients/android-vr/app/src/main/cpp/CMakeLists.txt
++++ b/clients/android-vr/app/src/main/cpp/CMakeLists.txt
+@@ -66,6 +66,7 @@ add_library(oxrsys_android SHARED
+     NetworkReceiver.cpp
+     TrackingSender.cpp
+     UsbNetworkLink.cpp
++    AudioReceiver.cpp
+ )
+ 
+ target_include_directories(oxrsys_android PRIVATE
+@@ -79,6 +80,7 @@ target_link_libraries(oxrsys_android PRIVATE
+     android
+     log
+     mediandk
++    aaudio
+     nativewindow
+     EGL
+     GLESv3
+diff --git a/clients/android-vr/app/src/main/cpp/XrApp.cpp b/clients/android-vr/app/src/main/cpp/XrApp.cpp
+index a23ea48..cdbdc93 100644
+--- a/clients/android-vr/app/src/main/cpp/XrApp.cpp
++++ b/clients/android-vr/app/src/main/cpp/XrApp.cpp
+@@ -1097,6 +1097,8 @@ bool XrApp::Initialize(struct android_app* app)
+         return false;
+     }
+ 
++    audioReceiver_.Start();
++
+     // Don't create swapchains yet — wait for SESSION_READY
+     running_ = true;
+     LOGI("XrApp initialized successfully");
+@@ -1805,6 +1807,11 @@ bool XrApp::SetupActions()
+     strncpy(actionInfo.localizedActionName, "B/Y Button", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+     XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &bButtonAction_), "xrCreateAction(b_button)");
+ 
++    // Thumbstick click (boolean, both hands): streamed as BUTTON_LEFT/RIGHT_THUMBSTICK.
++    strncpy(actionInfo.actionName, "thumbstick_click", XR_MAX_ACTION_NAME_SIZE);
++    strncpy(actionInfo.localizedActionName, "Thumbstick Click", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
++    XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &thumbstickClickAction_), "xrCreateAction(thumbstick_click)");
++
+     // Menu button (boolean, left hand only)
+     actionInfo.countSubactionPaths = 1;
+     actionInfo.subactionPaths = &handPaths_[0]; // left hand
+@@ -1819,7 +1826,7 @@ bool XrApp::SetupActions()
+     strncpy(actionInfo.localizedActionName, "Haptic", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+     XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &hapticAction_), "xrCreateAction(haptic)");
+ 
+-    XrPath bindingPaths[17];
++    XrPath bindingPaths[19];
+     xrStringToPath(instance_, "/user/hand/left/input/grip/pose", &bindingPaths[0]);
+     xrStringToPath(instance_, "/user/hand/right/input/grip/pose", &bindingPaths[1]);
+     xrStringToPath(instance_, "/user/hand/left/input/aim/pose", &bindingPaths[2]);
+@@ -1837,6 +1844,8 @@ bool XrApp::SetupActions()
+     xrStringToPath(instance_, "/user/hand/left/input/menu/click", &bindingPaths[14]);
+     xrStringToPath(instance_, "/user/hand/left/output/haptic", &bindingPaths[15]);
+     xrStringToPath(instance_, "/user/hand/right/output/haptic", &bindingPaths[16]);
++    xrStringToPath(instance_, "/user/hand/left/input/thumbstick/click", &bindingPaths[17]);
++    xrStringToPath(instance_, "/user/hand/right/input/thumbstick/click", &bindingPaths[18]);
+ 
+     XrActionSuggestedBinding bindingsWithAim[] = {
+         {gripPoseAction_, bindingPaths[0]},
+@@ -1856,6 +1865,8 @@ bool XrApp::SetupActions()
+         {menuAction_, bindingPaths[14]},
+         {hapticAction_, bindingPaths[15]},
+         {hapticAction_, bindingPaths[16]},
++        {thumbstickClickAction_, bindingPaths[17]},
++        {thumbstickClickAction_, bindingPaths[18]},
+     };
+     XrActionSuggestedBinding bindingsWithoutAim[] = {
+         {gripPoseAction_, bindingPaths[0]},
+@@ -1873,6 +1884,8 @@ bool XrApp::SetupActions()
+         {menuAction_, bindingPaths[14]},
+         {hapticAction_, bindingPaths[15]},
+         {hapticAction_, bindingPaths[16]},
++        {thumbstickClickAction_, bindingPaths[17]},
++        {thumbstickClickAction_, bindingPaths[18]},
+     };
+ 
+     const char* controllerProfiles[] = {
+@@ -3825,6 +3838,19 @@ void XrApp::RunFrame()
+                  frameRefreshRateHz);
+             clientRefreshRateHz_ = frameRefreshRateHz;
+         }
++        // The system can move the display off the preferred rate (shell, guardian, another app);
++        // a stream at the preferred rate then judders. Ask again, at most every two seconds.
++        static auto lastRefreshRequest = std::chrono::steady_clock::time_point{};
++        const auto nowRefresh = std::chrono::steady_clock::now();
++        if (xrRequestDisplayRefreshRateFB_ != nullptr &&
++            std::fabs(static_cast<float>(frameRefreshRateHz) - kPreferredDisplayRefreshRateHz) > 0.5f &&
++            nowRefresh - lastRefreshRequest >= std::chrono::seconds(2))
++        {
++            lastRefreshRequest = nowRefresh;
++            const XrResult r = xrRequestDisplayRefreshRateFB_(session_, kPreferredDisplayRefreshRateHz);
++            LOGI("Display at %uHz, re-requested preferred %.1fHz: %d",
++                 frameRefreshRateHz, kPreferredDisplayRefreshRateHz, static_cast<int>(r));
++        }
+     }
+ 
+     // xrBeginFrame
+@@ -4255,15 +4281,17 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
+         }
+         else if (hasVideoTexture_)
+         {
+-            // Check if the stream has been lost (no new frames for 2 seconds)
++            // Check if the stream has been lost. Games pause their frames for many seconds during
++            // level loads and first-time shader compiles (Mirror's Edge on DXVK/MoltenVK); the last
++            // frame keeps being shown, reprojected, instead of dropping to the shell/passthrough.
+             auto elapsed = std::chrono::steady_clock::now() - lastVideoFrameTime_;
+-            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 2)
++            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 30)
+             {
+                 // Stream lost (Godot closed, Mac disconnected, etc.)
+                 hasVideoTexture_ = false;
+                 hasCurrentRenderPose_ = false;
+                 presentedVideoFrame_ = {};
+-                OnConnectionLost("no video frames for 2 seconds");
++                OnConnectionLost("no video frames for 30 seconds");
+             }
+             else
+             {
+@@ -5482,6 +5510,14 @@ protocol::TrackingPacket XrApp::BuildTrackingPacket(XrTime predictedDisplayTime)
+     {
+         buttons |= protocol::BUTTON_MENU;
+     }
++    if (readBooleanAction(thumbstickClickAction_, handPaths_[0]))
++    {
++        buttons |= protocol::BUTTON_LEFT_THUMBSTICK;
++    }
++    if (readBooleanAction(thumbstickClickAction_, handPaths_[1]))
++    {
++        buttons |= protocol::BUTTON_RIGHT_THUMBSTICK;
++    }
+     packet.buttonState = buttons;
+ 
+     // Debug: log position periodically to verify 6DOF tracking
+diff --git a/clients/android-vr/app/src/main/cpp/XrApp.h b/clients/android-vr/app/src/main/cpp/XrApp.h
+index afbe0b1..db00218 100644
+--- a/clients/android-vr/app/src/main/cpp/XrApp.h
++++ b/clients/android-vr/app/src/main/cpp/XrApp.h
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ #pragma once
++#include "AudioReceiver.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -202,6 +203,8 @@ class XrApp
+     XrAction aButtonAction_ = XR_NULL_HANDLE;
+     XrAction bButtonAction_ = XR_NULL_HANDLE;
+     XrAction menuAction_ = XR_NULL_HANDLE;
++    XrAction thumbstickClickAction_ = XR_NULL_HANDLE;
++    AudioReceiver audioReceiver_;   // Mac-side game audio (TCP 9950 via adb reverse)
+     XrAction hapticAction_ = XR_NULL_HANDLE;
+     XrSpace gripSpaces_[2] = {};     // [0]=left, [1]=right
+     XrSpace aimSpaces_[2] = {};      // [0]=left, [1]=right
+diff --git a/runtime/src/StreamingServer.cpp b/runtime/src/StreamingServer.cpp
+index 94481cd..093b078 100644
+--- a/runtime/src/StreamingServer.cpp
++++ b/runtime/src/StreamingServer.cpp
+@@ -1792,9 +1792,9 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
+         packetDispatchState_->videoUsesTcp = false;
+         packetDispatchState_->acceptingPackets = true;
+     }
+-    uint32_t negotiatedRefresh = clientConnect.refreshRateHz > 0
+-        ? clientConnect.refreshRateHz
+-        : refreshRateHz_;
++    // The configured target wins: the Quest client samples its display rate at connect time, often
++    // before its own switch to the preferred rate has landed (reported 90 while settling at 72).
++    uint32_t negotiatedRefresh = refreshRateHz_ > 0 ? refreshRateHz_ : clientConnect.refreshRateHz;
+     spdlog::info("StreamingServer: WiFi client '{}' refresh report={}Hz server_target={}Hz negotiated={}Hz",
+                  clientName,
+                  clientConnect.refreshRateHz,
+@@ -2057,9 +2057,9 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
+         packetDispatchState_->videoUsesTcp = true;
+         packetDispatchState_->acceptingPackets = true;
+     }
+-    uint32_t negotiatedRefresh = clientConnect.refreshRateHz > 0
+-        ? clientConnect.refreshRateHz
+-        : refreshRateHz_;
++    // The configured target wins: the Quest client samples its display rate at connect time, often
++    // before its own switch to the preferred rate has landed (reported 90 while settling at 72).
++    uint32_t negotiatedRefresh = refreshRateHz_ > 0 ? refreshRateHz_ : clientConnect.refreshRateHz;
+     spdlog::info("StreamingServer: USB client '{}' refresh report={}Hz server_target={}Hz negotiated={}Hz",
+                  clientName,
+                  clientConnect.refreshRateHz,
+diff --git a/runtime/src/SwapchainCreateValidation.h b/runtime/src/SwapchainCreateValidation.h
+index ab6e3dd..5ddee76 100644
+--- a/runtime/src/SwapchainCreateValidation.h
++++ b/runtime/src/SwapchainCreateValidation.h
+@@ -30,6 +30,9 @@ constexpr XrSwapchainUsageFlags SupportedUsageFlags(GraphicsApi api)
+     }
+     if (api == GraphicsApi::Vulkan)
+     {
++        // Applications that copy a finished frame in (vkCmdCopyImage / vkCmdBlitImage)
++        // declare TRANSFER_DST; SwapchainVulkan adds VK_IMAGE_USAGE_TRANSFER_DST_BIT.
++        flags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+         // Godot creates UNORM swapchain images and renders through an sRGB view of them.
+         // SwapchainVulkan maps this to VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
+         flags |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+diff --git a/runtime/src/SwapchainVulkan.cpp b/runtime/src/SwapchainVulkan.cpp
+index 6c61e07..c9478f1 100644
+--- a/runtime/src/SwapchainVulkan.cpp
++++ b/runtime/src/SwapchainVulkan.cpp
+@@ -215,7 +215,9 @@ void Swapchain::InitVulkan(void* /*metalDevice*/, const VulkanGraphicsContext& v
+     imageCI.usage = isDepth
+         ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+         : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+-           VK_IMAGE_USAGE_SAMPLED_BIT);
++           VK_IMAGE_USAGE_SAMPLED_BIT |
++           ((createInfo->usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT) != 0
++                ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0u));
+     imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+     if ((createInfo->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0)
