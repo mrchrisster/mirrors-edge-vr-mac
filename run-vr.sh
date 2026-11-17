@@ -32,6 +32,15 @@ ln -sfn "My Documents" "$MEVR_ENV_USERPROFILE/Documents" 2>/dev/null
 export MEVR_GAME_EXE="$R/work/pc/Binaries/MirrorsEdge.exe"
 export ME_VR="$M/libmevr.dylib"
 export ME_PC_DXVK="$R/work/dxvk/bin-vr/libdxvk_d3d9.0.dylib"
+# The engine renders at the size in its TdEngine.ini; keep it equal to mevr.ini's Resolution (the mod
+# offers that mode). The file appears after the first start.
+RES=$(sed -n 's/^Resolution = \([0-9]*\)x\([0-9]*\).*/\1 \2/p' "$M/mevr.ini" | head -1)
+TDE="$MEVR_ENV_USERPROFILE/My Documents/EA Games/Mirror's Edge/TdGame/Config/TdEngine.ini"
+if [ -n "$RES" ] && [ -f "$TDE" ]; then
+  set -- $RES "$@"; RX=$1; RY=$2; shift 2
+  sed -i '' -e "s/^ResX=.*/ResX=$RX/" -e "s/^ResY=.*/ResY=$RY/" "$TDE"
+fi
+
 # Straight into VR: MEVR_START=<checkpoint> (list: MEVR_START=--list) skips the intro movie, starts a game in the
 # quick-start profile (Return taps), then loads that checkpoint with F11 (frame MEVR_START_FRAME, default 4800).
 if [ -n "$MEVR_START" ]; then

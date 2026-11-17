@@ -57,15 +57,15 @@ What this repository adds:
   - recompiler entry hooks for three game functions
   - calls from host into game code
   - the audio tap
-- **`patches/dxvk-3.1.1-mevr-on-top-of-macos.patch`**: lets the VR module create DXVK's Vulkan instance and device
-  through OpenXR.
+- **`mevr-mac/dxvk_patch.py`**: lets the VR module create DXVK's Vulkan instance and device through OpenXR.
 - **`patches/OXRSys-mevr.patch`**: runtime and Quest-client fixes found along the way:
   - swapchains a Vulkan app can copy into
   - thumbstick clicks
   - holding the last frame through long game pauses
   - refresh-rate negotiation
   - a game-audio player in the Quest app
-- **`run-vr.sh`**: one launcher, including a quick start straight into any of the game's checkpoints.
+- **`setup.sh`** and **`run-vr.sh`**: one-command setup from your game installer, and one launcher, with a quick start
+  straight into any of the game's checkpoints.
 
 Workarounds handled in the glue (OXRSys specifics):
 
@@ -93,32 +93,40 @@ Known issues and limits:
 - **Headset audio is new.** Audio to the headset is new and lightly tested.
 - **USB 2.0 cables stutter.** Use a USB 3 cable; at 480 Mbit/s the stream stutters above about 80 Mbit/s.
 
-## Building (outline)
+## Setup
 
-You need everything RunnerRecompiled's macOS guide needs (Homebrew LLVM 23, SDL3, MoltenVK, meson, …), plus a
-Khronos OpenXR loader, OXRSys, Android SDK/NDK for the Quest app, and `adb`.
+You need an Apple Silicon Mac (macOS 14 or later), the Xcode Command Line Tools, [Homebrew](https://brew.sh), about
+20 GB free, a Quest 3 with developer mode, a **USB 3** USB-C cable, and the GOG offline installer of *Mirror's Edge*
+1.01 (`setup_mirrors_edge_1.01_jpfix_(41238).exe` plus its `-1.bin`, `-2.bin`, `-3.bin` parts).
 
-1. Put the upstream projects inside this folder (they are git-ignored). Each patch records the commit it applies to
-   in its `.base` file.
-   - `RunnerRecompiled/`: `git clone -b macos-port https://github.com/prasys/RunnerRecompiled`. Apply
-     `patches/RunnerRecompiled-mevr.patch` and follow its `pc/MACOS-BUILD.md` with your GOG files. Then regenerate the
-     D3D9 bridge and relift (`build_pc_runtime.py --regen`).
-   - Build DXVK with RunnerRecompiled's `pc/dxvk/build-macos.sh`, then apply
-     `patches/dxvk-3.1.1-mevr-on-top-of-macos.patch` in that tree. Rebuild and copy the dylib to
-     `RunnerRecompiled/work/dxvk/bin-vr/`.
-   - `vr-mod/`: `git clone https://github.com/letsgosportsteam/mirrors-edge-vr-mod vr-mod`.
-   - `deps/oxrsys/`: `git clone https://github.com/demonixis/OXRSys`. Apply `patches/OXRSys-mevr.patch`, build the
-     runtime (`cmake --preset macos-arm64`), then build and install the Quest app (`clients/android-vr`,
-     `./gradlew assembleRelease`).
-2. Build the VR module: `OPENXR_DIR=<loader install> mevr-mac/build.sh` (this runs `port_patch.py` on `vr-mod/`
-   first time: `python3 -I mevr-mac/port_patch.py`).
-3. Connect the Quest by USB, open the OXRSys app, and run `./run-vr.sh`, or
-   `MEVR_START=Before_Balance_Walk ./run-vr.sh` to jump straight into a checkpoint
-   (`MEVR_START=--list ./run-vr.sh` lists them).
+```bash
+git clone https://github.com/mrchrisster/mirrors-edge-vr-mac
+cd mirrors-edge-vr-mac
+./setup.sh ~/Downloads/'setup_mirrors_edge_1.01_jpfix_(41238).exe'
+```
 
-OXRSys settings that worked best over USB 3 (`~/Library/Application Support/OXRSys/oxrsys-runtime.toml`):
-`transport = "usb_adb"`, `render_device = "quest3_native"`, `resolution_scale = 1.0`, `bitrate_mbps = 150`,
-`abr_mode = "off"`, `foveated_encoding_preset = "off"`.
+`setup.sh` does everything, inside this folder:
+- installs the Homebrew packages it needs
+- downloads the pinned upstream projects and applies the patches
+- extracts and recompiles your copy of the game (10 to 20 minutes the first time)
+- builds DXVK, the OpenXR loader, the OXRSys runtime and the VR module
+- writes OXRSys settings that work well over USB
+- installs the OXRSys Quest app if the headset is connected
+
+The Quest app comes prebuilt from this repo's Releases page, or is built locally if you have the Android SDK. The
+script is safe to re-run.
+
+Then connect the Quest by USB, put it on, and run:
+
+```bash
+./run-vr.sh                                   # start the game in VR
+MEVR_START=Before_Balance_Walk ./run-vr.sh    # or jump straight into a checkpoint
+MEVR_START=--list ./run-vr.sh                 # list the checkpoints
+```
+
+**On a USB 2 link:** the stream stutters at 480 Mbit/s. Check the link with
+`system_profiler SPUSBHostDataType | grep -A12 Quest`. If it shows 480 Mbit/s, lower `bitrate_mbps` to 80 in
+`~/Library/Application Support/OXRSys/oxrsys-runtime.toml`.
 
 ## Credits
 
