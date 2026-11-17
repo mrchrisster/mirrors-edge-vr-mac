@@ -146,7 +146,8 @@ fi
 step "OXRSys Quest app"
 APK=deps/oxrsys-quest-mevr.apk
 if [ ! -f "$APK" ]; then
-    if [ -n "${ANDROID_HOME:-}" ] || [ -d "$HOME/Library/Android/sdk" ]; then
+    # The prebuilt app from this repo's release; MEVR_BUILD_APK=1 builds it instead (needs the Android SDK/NDK).
+    if [ "${MEVR_BUILD_APK:-0}" = 1 ]; then
         (cd deps/oxrsys/clients/android-vr && ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk} \
             JAVA_HOME=${JAVA_HOME:-"/Applications/Android Studio.app/Contents/jbr/Contents/Home"} ./gradlew -q assembleRelease) &&
             cp deps/oxrsys/clients/android-vr/app/build/outputs/apk/release/app-release.apk "$APK" || true

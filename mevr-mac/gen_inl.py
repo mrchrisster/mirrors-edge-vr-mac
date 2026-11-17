@@ -2,6 +2,7 @@
 import hashlib, os, re, sys
 root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "vr-mod"))
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen")
+os.makedirs(out, exist_ok=True)
 ini = open(os.path.join(root, "mevr.ini.example"), encoding="utf-8").read()
 rx = r"(?m)^; Rename this file to  mevr\.ini  and leave it beside d3d9\.dll.*$"
 assert re.search(rx, ini), "shipped defaults no longer match mevr.ini.example"
