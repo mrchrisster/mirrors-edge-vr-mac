@@ -1,3 +1,6 @@
+[mirrors-edge-vr-stereo.png]
+
+
 # Mirror's Edge VR on macOS → Meta Quest
 
 An experiment: can a **static recompilation** of *Mirror's Edge* (2008) running natively on Apple Silicon be combined
